@@ -1,0 +1,436 @@
+#!/usr/bin/env python3
+"""quha-settings - Quha Zono Einstellungen per Kommandozeile, ohne Wine.
+
+Spricht direkt über /dev/hidraw* mit dem Quha USB Receiver (04d8:f8c4).
+Das Protokoll stammt aus der Analyse von "Quha Zono Settings.exe"
+(7-Byte-Reports, Report-ID 0).
+
+  quha-settings get
+  quha-settings speed H [V]            21..255, NIEDRIGER Wert = SCHNELLER
+                                       (21 = schnellste Stufe; nur H = beide)
+  quha-settings filter MODE [STUFE]    MODE: off | 1 | 2 | 3 | joystick, STUFE 0..3
+  quha-settings doubleclick off|MS     Doppelklick-Assistent, 1..2048 ms
+  quha-settings autoclick off|DELAY [EMPF]
+                                       DELAY 1..500 (Einheit 10 ms), EMPF 0..2
+  quha-settings calibrate NAME --yes   Anbringungsstelle laden, NAME: kopf-rechts,
+                                       kopf-links, hand-rechts, hand-links,
+                                       fuss-rechts, fuss-links
+  quha-settings calibrate free --yes   freie Stelle: Zeiger erst nach rechts, dann
+                                       nach unten bewegen (Messung im Empfänger)
+  quha-settings reset --yes            Werksreset des Empfängers
+  quha-settings get --calibration      zusätzlich Kalibrier-Register 0x10..0x15
+
+ACHTUNG: calibrate und reset setzen den Empfänger zuerst auf Werkseinstellungen
+zurück (Geschwindigkeit, Dämpfung, Doppelklick, Kalibrierung), wie die Original-
+Software. Danach ggf. die eigenen Werte neu setzen.
+
+Optionen: --device /dev/hidrawN   statt automatischer Suche
+          --dry-run               nur anzeigen, was gesendet würde
+"""
+import argparse
+import glob
+import os
+import select
+import sys
+import time
+
+VID, PID = 0x04D8, 0xF8C4
+
+CMD_READ, CMD_READ_REPLY, CMD_WRITE = 0xF0, 0xF1, 0xF2
+CMD_FILTER_GET, CMD_FILTER_REPLY, CMD_FILTER_SET = 0x30, 0x31, 0x32
+
+REG_SPEED_H, REG_SPEED_V = 0x30, 0x31
+REG_DBLCLICK = 0x40
+REG_AUTOCLICK_DELAY, REG_AUTOCLICK_SENS = 0x41, 0x42
+
+# Kalibrierung (aus Qcal.exe)
+CMD_MEASURE, CMD_MEASURE_DONE, CMD_RESET = 0x20, 0x21, 0xFF
+MEASURE_RIGHT, MEASURE_DOWN = 0x22, 0x12
+RESET_MAGIC = b"Reset"          # Werksreset: FF 'R' 'e' 's' 'e' 't'
+MEASURE_TIMEOUT = 60.0          # so lange wartet auch das Original
+REG_CAL_FIRST, REG_CAL_LAST = 0x10, 0x15
+
+# Anbringungsstellen: Registerwerte wie im Original (Finnisch: paa = Kopf,
+# kasi = Hand, jalka = Fuß; oikea = rechts, vasen = links)
+_KOPF = {0x10: 0x807F, 0x11: 0, 0x12: 0, 0x13: 0, 0x14: 0, 0x30: 0x90, 0x31: 0x60}
+_HAND = {0x10: 0x7F, 0x11: 0, 0x12: 0, 0x13: 0, 0x14: 0x7F, 0x15: 0, 0x30: 0xB0, 0x31: 0xB0}
+_FUSS = {0x10: 0, 0x11: 0, 0x12: 0x807F, 0x13: 0, 0x14: 0x807F, 0x15: 0, 0x30: 0x80, 0x31: 0x80}
+PRESETS = {
+    "kopf-rechts": dict(sorted({**_KOPF, 0x15: 0x807F}.items())),
+    "kopf-links": dict(sorted({**_KOPF, 0x15: 0x7F}.items())),
+    "hand-rechts": dict(sorted(_HAND.items())),
+    "hand-links": dict(sorted(_HAND.items())),
+    "fuss-rechts": dict(sorted(_FUSS.items())),
+    "fuss-links": dict(sorted(_FUSS.items())),
+}
+
+SPEED_MIN, SPEED_MAX = 21, 255
+DBLCLICK_MIN, DBLCLICK_MAX = 1, 2048
+AUTOCLICK_DELAY_MIN, AUTOCLICK_DELAY_MAX = 1, 500
+AUTOCLICK_SENS_MAX = 2
+
+FILTER_IDS = {"off": 0, "1": 1, "2": 2, "3": 4, "joystick": 8}
+FILTER_NAMES = {0: "aus", 1: "Vibrationsdämpfung 1", 2: "Vibrationsdämpfung 2",
+                4: "Vibrationsdämpfung 3", 8: "Joystick-Zustand"}
+
+UDEV_HINT = (
+    "Keine Berechtigung auf /dev/hidraw*. udev-Regel anlegen:\n"
+    '  echo \'KERNEL=="hidraw*", ATTRS{idVendor}=="04d8", ATTRS{idProduct}=="f8c4", '
+    "MODE=\"0666\"' | sudo tee /etc/udev/rules.d/99-quha.rules\n"
+    "  sudo udevadm control --reload-rules && sudo udevadm trigger\n"
+    "Danach den Empfänger neu einstecken."
+)
+
+
+class QuhaError(Exception):
+    pass
+
+
+def frame(cmd, *data):
+    """7-Byte-Report wie in der Windows-Software (Byte 0 = Report-ID 0)."""
+    buf = bytes([0, cmd] + [d & 0xFF for d in data])
+    return buf.ljust(7, b"\x00")
+
+
+def filter_strength_byte(mode, level):
+    """Stufe 0..3 -> Byte, wie es die Settings-App berechnet."""
+    if mode == 0:
+        return 0
+    if mode == 4:                      # Vibrationsdämpfung 3
+        return (level + 1) * 20
+    return level * 85                  # 1, 2, Joystick
+
+
+def filter_level_from_byte(mode, value):
+    if mode == 4:
+        return max(0, value // 20 - 1)
+    return value // 85 if mode else 0
+
+
+class Device:
+    def __init__(self, fd, dry_run=False):
+        self.fd = fd
+        self.dry_run = dry_run
+
+    # -- Low level ---------------------------------------------------------
+    def _drain(self):
+        while select.select([self.fd], [], [], 0)[0]:
+            if not os.read(self.fd, 64):
+                break
+
+    def _recv(self, timeout=1.0):
+        end = time.monotonic() + timeout
+        while True:
+            left = end - time.monotonic()
+            if left <= 0:
+                return None
+            if select.select([self.fd], [], [], left)[0]:
+                data = os.read(self.fd, 64)
+                if not data:
+                    return None
+                # hidraw ohne Report-IDs liefert 6 Bytes; auf 7 normalisieren
+                if len(data) == 6:
+                    data = b"\x00" + data
+                return data[:7].ljust(7, b"\x00")
+
+    def _send(self, buf, ack_ok=lambda r: r[1] == 1):
+        if self.dry_run:
+            print("  würde senden:", " ".join(f"{x:02X}" for x in buf))
+            return True
+        self._drain()
+        os.write(self.fd, buf)
+        ack = self._recv()
+        return ack is not None and ack_ok(ack)
+
+    def _wait_for(self, reply_cmd, tries=20):
+        for _ in range(tries):
+            r = self._recv()
+            if r is None:
+                return None
+            if r[1] == reply_cmd:
+                return r
+        return None
+
+    # -- Protokoll ---------------------------------------------------------
+    def write_reg(self, addr, value):
+        ok = self._send(frame(CMD_WRITE, addr, value & 0xFF, (value >> 8) & 0xFF))
+        if not ok:
+            raise QuhaError(f"Schreiben von Register 0x{addr:02X} nicht bestätigt")
+
+    def read_reg(self, addr):
+        if self.dry_run:
+            return None
+        if not self._send(frame(CMD_READ, addr)):
+            return None
+        r = self._wait_for(CMD_READ_REPLY)
+        return None if r is None else (r[4] << 8) | r[3]
+
+    def set_filter(self, mode, strength):
+        ok = self._send(frame(CMD_FILTER_SET, mode, strength))
+        if not ok:
+            raise QuhaError("Filter setzen nicht bestätigt")
+
+    def get_filter(self):
+        if self.dry_run:
+            return None
+        if not self._send(frame(CMD_FILTER_GET)):
+            return None
+        r = self._wait_for(CMD_FILTER_REPLY)
+        return None if r is None else (r[2], r[3])
+
+    def write_reg32(self, addr, value):
+        """32-Bit-Wert (little endian), wie sendCalibrationData im Original."""
+        ok = self._send(frame(CMD_WRITE, addr, *value.to_bytes(4, "little")))
+        if not ok:
+            raise QuhaError(f"Schreiben von Register 0x{addr:02X} nicht bestätigt")
+
+    def reset(self):
+        ok = self._send(frame(CMD_RESET, *RESET_MAGIC), ack_ok=lambda r: r[1] != 0)
+        if not ok:
+            raise QuhaError("Werksreset nicht bestätigt")
+
+    def measure(self, code, timeout=MEASURE_TIMEOUT):
+        """Messung im Empfänger starten und auf 'fertig' (0x21) warten."""
+        if not self._send(frame(CMD_MEASURE, code)):
+            raise QuhaError("Messung nicht gestartet (keine Bestätigung)")
+        if self.dry_run:
+            return
+        r = self._recv(timeout)
+        if r is None:
+            raise QuhaError(f"Keine Antwort innerhalb von {timeout:.0f} s")
+        if r[1] != CMD_MEASURE_DONE:
+            raise QuhaError("Messung fehlgeschlagen, Antwort: "
+                            + " ".join(f"{x:02X}" for x in r))
+
+
+# -- Geräte-Suche -----------------------------------------------------------
+def candidate_paths():
+    paths = []
+    for node in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
+        try:
+            with open(os.path.join(node, "device", "uevent")) as f:
+                text = f.read().upper()
+        except OSError:
+            continue
+        if f"HID_ID=0003:{VID:08X}:{PID:08X}" in text:
+            paths.append("/dev/" + os.path.basename(node))
+    return paths
+
+
+def open_device(path_override, dry_run):
+    if dry_run:
+        return Device(-1, dry_run=True)
+    paths = [path_override] if path_override else candidate_paths()
+    if not paths:
+        raise QuhaError("Quha-Empfänger (04d8:f8c4) nicht gefunden. "
+                        "Eingesteckt? Alternativ --device /dev/hidrawN.")
+    denied = False
+    for path in paths:
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+        except PermissionError:
+            denied = True
+            continue
+        except OSError:
+            continue
+        dev = Device(fd)
+        try:
+            # Das richtige Interface antwortet auf eine Leseanfrage
+            if dev.read_reg(REG_SPEED_H) is not None:
+                return dev
+        except OSError:
+            pass
+        os.close(fd)
+    if denied:
+        raise QuhaError(UDEV_HINT)
+    raise QuhaError("Kein HID-Interface des Empfängers hat geantwortet.")
+
+
+# -- Kommandos --------------------------------------------------------------
+def int_in(name, text, lo, hi):
+    try:
+        v = int(text)
+    except ValueError:
+        raise QuhaError(f"{name}: '{text}' ist keine Zahl")
+    if not lo <= v <= hi:
+        raise QuhaError(f"{name}: {v} außerhalb {lo}..{hi}")
+    return v
+
+
+def cmd_get(dev, args):
+    h, v = dev.read_reg(REG_SPEED_H), dev.read_reg(REG_SPEED_V)
+    flt = dev.get_filter()
+    dbl = dev.read_reg(REG_DBLCLICK)
+    acd, acs = dev.read_reg(REG_AUTOCLICK_DELAY), dev.read_reg(REG_AUTOCLICK_SENS)
+    print(f"Geschwindigkeit horizontal : {h}")
+    print(f"Geschwindigkeit vertikal   : {v}")
+    if flt is None:
+        print("Vibrationsdämpfung         : (keine Antwort)")
+    else:
+        mode, raw = flt
+        name = FILTER_NAMES.get(mode, f"unbekannt (0x{mode:02X})")
+        extra = f", Stufe {filter_level_from_byte(mode, raw)}" if mode else ""
+        print(f"Vibrationsdämpfung         : {name}{extra}  [roh {mode}/{raw}]")
+    print("Doppelklick-Assistent      : "
+          + ("aus" if not dbl else f"{dbl} ms"))
+    if not acd:
+        print("Autoklick                  : aus")
+    else:
+        print(f"Autoklick                  : Verzögerung {acd / 100:.2f} s, "
+              f"Empfindlichkeit {acs}")
+    if args.calibration:
+        regs = []
+        for r in range(REG_CAL_FIRST, REG_CAL_LAST + 1):
+            v = dev.read_reg(r)
+            regs.append(f"0x{r:02X}=" + ("?" if v is None else f"0x{v:X}"))
+        print("Kalibrier-Register         : " + "  ".join(regs))
+
+
+def cmd_speed(dev, args):
+    h = int_in("H", args.h, SPEED_MIN, SPEED_MAX)
+    v = int_in("V", args.v, SPEED_MIN, SPEED_MAX) if args.v else h
+    dev.write_reg(REG_SPEED_H, h)
+    dev.write_reg(REG_SPEED_V, v)
+    print(f"Geschwindigkeit gesetzt: horizontal {h}, vertikal {v}")
+
+
+def cmd_filter(dev, args):
+    mode = FILTER_IDS[args.mode]
+    level = int_in("STUFE", args.level, 0, 3) if args.level is not None else 1
+    dev.set_filter(mode, filter_strength_byte(mode, level))
+    print(f"Filter gesetzt: {FILTER_NAMES[mode]}"
+          + (f", Stufe {level}" if mode else ""))
+
+
+def cmd_doubleclick(dev, args):
+    ms = 0 if args.value == "off" else int_in("MS", args.value, DBLCLICK_MIN, DBLCLICK_MAX)
+    dev.write_reg(REG_DBLCLICK, ms)
+    print("Doppelklick-Assistent: " + ("aus" if not ms else f"{ms} ms"))
+
+
+def cmd_autoclick(dev, args):
+    if args.delay == "off":
+        dev.write_reg(REG_AUTOCLICK_DELAY, 0)
+        print("Autoklick: aus")
+        return
+    delay = int_in("DELAY", args.delay, AUTOCLICK_DELAY_MIN, AUTOCLICK_DELAY_MAX)
+    sens = int_in("EMPF", args.sens, 0, AUTOCLICK_SENS_MAX) if args.sens is not None else 2
+    dev.write_reg(REG_AUTOCLICK_DELAY, delay)
+    dev.write_reg(REG_AUTOCLICK_SENS, sens)
+    print(f"Autoklick: Verzögerung {delay / 100:.2f} s, Empfindlichkeit {sens}")
+
+
+def confirm(args, what):
+    """Zerstörende Befehle nur mit --yes (oder im Dry-Run)."""
+    if not (args.yes or args.dry_run):
+        raise QuhaError(f"{what}\nZur Bestätigung --yes angeben.")
+
+
+def baseline(dev):
+    """Wie die Original-Software vor jeder Kalibrierung."""
+    dev.reset()
+    dev.set_filter(0, 0)
+    dev.write_reg(REG_DBLCLICK, 0)
+
+
+CONFIRM_TEXT = {
+    "reset": "Werksreset: setzt Einstellungen und Kalibrierung des "
+             "Empfängers zurück.",
+    "calibrate": "Setzt den Empfänger auf Werkseinstellungen zurück "
+                 "(Geschwindigkeit, Dämpfung, Doppelklick) und überschreibt "
+                 "die Kalibrierung.",
+}
+
+
+def cmd_reset(dev, args):
+    dev.reset()
+    print("Werksreset gesendet.")
+
+
+def cmd_calibrate(dev, args):
+    baseline(dev)
+    if args.name != "free":
+        for reg, val in PRESETS[args.name].items():
+            dev.write_reg32(reg, val)
+        print(f"Anbringungsstelle '{args.name}' geladen. "
+              "Eigene Werte (speed, filter, ...) ggf. neu setzen.")
+        return
+    for label, code in (("RECHTS", MEASURE_RIGHT), ("UNTEN", MEASURE_DOWN)):
+        if sys.stdin.isatty() and not dev.dry_run:
+            input(f"Bequeme Haltung einnehmen. Enter startet die Messung "
+                  f"nach {label} ... ")
+        print(f"Jetzt den Zeiger nach {label} bewegen "
+              f"(bis zu {MEASURE_TIMEOUT:.0f} s Zeit) ...", flush=True)
+        dev.measure(code)
+        print("  Messung erfolgreich.")
+    print("Kalibrierung abgeschlossen. Eigene Werte (speed, filter, ...) "
+          "ggf. neu setzen.")
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="quha-settings",
+                                description="Quha Zono Einstellungen ohne Wine")
+    p.add_argument("--device", help="hidraw-Gerät, z.B. /dev/hidraw0")
+    p.add_argument("--dry-run", action="store_true",
+                   help="nur anzeigen, was gesendet würde")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("get", help="aktuelle Einstellungen anzeigen")
+    s.add_argument("--calibration", action="store_true",
+                   help="zusätzlich Kalibrier-Register 0x10..0x15")
+    s.set_defaults(fn=cmd_get)
+
+    s = sub.add_parser("calibrate", help="Anbringungsstelle laden / freie Kalibrierung")
+    s.add_argument("name", choices=sorted(PRESETS) + ["free"])
+    s.add_argument("--yes", action="store_true",
+                   help="Werksreset und Überschreiben der Kalibrierung bestätigen")
+    s.set_defaults(fn=cmd_calibrate)
+
+    s = sub.add_parser("reset", help="Werksreset des Empfängers")
+    s.add_argument("--yes", action="store_true", help="Werksreset bestätigen")
+    s.set_defaults(fn=cmd_reset)
+
+    s = sub.add_parser("speed", help="Geschwindigkeit 21..255 (niedriger = schneller)")
+    s.add_argument("h")
+    s.add_argument("v", nargs="?")
+    s.set_defaults(fn=cmd_speed)
+
+    s = sub.add_parser("filter", help="Vibrationsdämpfung")
+    s.add_argument("mode", choices=sorted(FILTER_IDS))
+    s.add_argument("level", nargs="?", help="Stufe 0..3 (Standard 1)")
+    s.set_defaults(fn=cmd_filter)
+
+    s = sub.add_parser("doubleclick", help="Doppelklick-Assistent")
+    s.add_argument("value", help="off oder Millisekunden 1..2048")
+    s.set_defaults(fn=cmd_doubleclick)
+
+    s = sub.add_parser("autoclick", help="Autoklick (Verweilklick)")
+    s.add_argument("delay", help="off oder 1..500 (Einheit 10 ms)")
+    s.add_argument("sens", nargs="?", help="Empfindlichkeit 0..2 (Standard 2)")
+    s.set_defaults(fn=cmd_autoclick)
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        # Zerstörende Befehle: Bestätigung VOR jedem Gerätezugriff prüfen
+        if args.cmd in CONFIRM_TEXT:
+            confirm(args, CONFIRM_TEXT[args.cmd])
+        dev = open_device(args.device, args.dry_run)
+        try:
+            args.fn(dev, args)
+        finally:
+            if dev.fd >= 0:
+                os.close(dev.fd)
+    except QuhaError as e:
+        print(f"Fehler: {e}", file=sys.stderr)
+        return 1
+    except OSError as e:
+        print(f"Fehler beim Zugriff auf das Gerät: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

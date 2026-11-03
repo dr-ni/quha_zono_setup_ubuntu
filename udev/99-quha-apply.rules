@@ -1,0 +1,3 @@
+# Optional: beim Einstecken des Empfängers und beim Booten den Dienst
+# quha-settings.service starten, der die gewünschten Einstellungen setzt.
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="04d8", ATTRS{idProduct}=="f8c4", TAG+="systemd", ENV{SYSTEMD_WANTS}="quha-settings.service"

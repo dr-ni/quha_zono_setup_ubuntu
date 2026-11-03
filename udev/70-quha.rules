@@ -1,0 +1,4 @@
+# Quha USB Receiver (04d8:f8c4): Zugriff auf die hidraw-Geräte für den
+# angemeldeten Benutzer (uaccess). Gebraucht von quha-settings und von Wine.
+# Nur per SSH ohne lokale Sitzung: TAG+="uaccess" durch MODE="0666" ersetzen.
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="04d8", ATTRS{idProduct}=="f8c4", TAG+="uaccess"
